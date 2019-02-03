@@ -1,41 +1,36 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
 
-// CAN Stuff
+// CAN support using https://github.com/McNeight/CAN_Library
 #include <CAN.h>
 #include <SPI.h>
 #include <CAN_MCP2515.h>
 
-// Define our CAN speed (bitrate).
+// Debug logging
+//#define DEBUG 
+#ifdef DEBUG 
+  #define DPRINT(...)    Serial.print(__VA_ARGS__) 
+  #define DPRINTLN(...)  Serial.println(__VA_ARGS__)
+#else
+  #define DPRINT(...)
+  #define DPRINTLN(...)
+#endif
+
+// Define the CAN speed (bitrate).
 #define bitrate   CAN_BPS_500K
 #define CANBaseID 0x259 // 601
 
-int RRPM;
-int TEMP;
-int MPH;
-int TPS;
-int AFR;
-int MAP;
-int IAT;
-int AFC;
-
-unsigned long lastTimeMS;
-int readDelayMS = 2;
-bool isClearToRequest;
-unsigned long maxPollingIntervalMS = 1000;
-
 //  Arduino Serial Port
-//
-int RXChannel = 7;
-int TXChannel = 6;
+const int RXChannel = 7;
+const int TXChannel = 6;
 SoftwareSerial serialPort = SoftwareSerial(RXChannel, TXChannel);
 
-//
+unsigned long lastTimeMS;
+bool isClearToRequest;
+const int readDelayMS = 2;
+const unsigned long maxPollingIntervalMS = 1000;
+
 // Subaru SSM Request Packet
-//                                    |s |     RPM - 2 bytes    |   AFR   |   TPS   |   MAP   |   IAT   |  Temp  |   AFC  |checksum|
-byte ReqData[31] = {128, 16, 240, 26, 168, 0, 0, 0, 15, 0, 0, 14, 0, 0, 70, 0, 0, 21, 0, 0, 13, 0, 0, 18, 0, 0, 8, 0, 0, 9, 234};
-byte ReqDataSize = 31;
-int  ECUbytes[7] = {0, 0, 0, 0, 0, 0, 0};
 // ReqData
 //  128 - 0x80 - Header
 //   16 - 0x10 - Destination: ECU
@@ -52,16 +47,10 @@ int  ECUbytes[7] = {0, 0, 0, 0, 0, 0, 0};
 //  008 - 0x08 - Parameter: Temp
 //  009 - 0x09 - Parameter: AFC
 //  234 - 0xEA - Checksum
-
-
-//#define DEBUG   // If you comment this line, the DPRINT & DPRINTLN lines are defined as blank.
-#ifdef DEBUG    // Macros are usually in all capital letters.
-  #define DPRINT(...)    Serial.print(__VA_ARGS__)     //DPRINT is a macro, debug print
-  #define DPRINTLN(...)  Serial.println(__VA_ARGS__)   //DPRINTLN is a macro, debug print with new line
-#else
-  #define DPRINT(...)     //now defines a blank line
-  #define DPRINTLN(...)   //now defines a blank line
-#endif
+//                                    |s |     RPM - 2 bytes    |   AFR   |   TPS   |   MAP   |   IAT   |  Temp  |   AFC  |checksum|
+byte ReqData[31] = {128, 16, 240, 26, 168, 0, 0, 0, 15, 0, 0, 14, 0, 0, 70, 0, 0, 21, 0, 0, 13, 0, 0, 18, 0, 0, 8, 0, 0, 9, 234};
+byte ReqDataSize = 31;
+int  ECUbytes[7] = {0, 0, 0, 0, 0, 0, 0};
 
 
 void setup()
@@ -127,7 +116,6 @@ byte CheckSum(byte sum) {
   return counter;
 }
 
-
 void requestECUData() {
   writeECU(ReqData, ReqDataSize, serialPort);
 }
@@ -144,7 +132,7 @@ void writeECU(byte data[], byte length, SoftwareSerial &digiSerial) {
   }
 }
 
-// This will change the values in dataArray, populating them with values respective of the poll array address calls
+// Changes the values in dataArray, populating it with values respective of the poll array address calls
 boolean readECU(int* dataArray, byte dataArrayLength, boolean nonZeroes)
 {
   byte data = 0;
@@ -228,7 +216,7 @@ boolean readECU(int* dataArray, byte dataArrayLength, boolean nonZeroes)
   }
 }
 
-void CAN2RCP1(byte Rpm1, byte Rpm2, byte AFRCorrection, byte Tps, byte MAP, byte IAT, byte Temp, byte AFC)
+void CAN2RCP1(byte Rpm1, byte Rpm2, byte AFR, byte Tps, byte MAP, byte IAT, byte Temp, byte AFC)
 {
   CAN_Frame standard_message; // Create message object to use CAN message structure
   standard_message.id = CANBaseID;
