@@ -6,8 +6,6 @@
 #include <SPI.h>
 #include <CAN_MCP2515.h>
 
-boolean debugLogEnabled = true;
-
 // Debug logging
 #define DEBUG 
 #ifdef DEBUG 
