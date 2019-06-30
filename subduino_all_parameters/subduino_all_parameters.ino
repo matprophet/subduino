@@ -8,7 +8,7 @@
 #include <CAN_MCP2515.h>
 
 // Debug logging
-#define DEBUG 
+//#define DEBUG 
 #ifdef DEBUG 
   #define DPRINT(...)    Serial.print(__VA_ARGS__) 
   #define DPRINTLN(...)  Serial.println(__VA_ARGS__)
@@ -20,7 +20,16 @@
 #define SERIAL_DIAG_SPEED 115200
 #define SSM_BUS_SPEED 4800
 
-#define DEBUG_CAN 1
+#define DEBUG_CAN 0
+
+typedef struct {
+  byte header;
+  byte destination;
+  byte source;
+  byte dataSize;
+  byte *data;
+  byte checksum;
+} SSMPacket;
 
 enum SSMDevice {
   kSSMDeviceECU = 0x10,
@@ -28,39 +37,36 @@ enum SSMDevice {
   kSSMDeviceDiagTool = 0xF0,
 };
 
-enum SSMCmd {
-  kSSMCmdBlockRead = 0xA0,
-  kSSMCmdAddressRead = 0xA8,
-  kSSMCmdBlockWrite = 0xB0, 
-  kSSMCmdAddressWrite = 0xB8,
-  kSSMCmdECUInit = 0xBF,
+enum SSMCommand {
+  kSSMCommandBlockRead = 0xA0,
+  kSSMCommandAddressRead = 0xA8,
+  kSSMCommandBlockWrite = 0xB0, 
+  kSSMCommandAddressWrite = 0xB8,
+  kSSMCommandECUInit = 0xBF,
 };
 
 enum SSMResponse {
-  kSSMResponseSingle = 0x00,
-  kSSMResponseStreamed = 0x01,
+  kSSMResponseBlockRead = 0xE0,
+  kSSMResponseAddressRead = 0xE8,
+  kSSMResponseBlockWrite = 0xF0, 
+  kSSMResponseAddressWrite = 0xF8,
+  kSSMResponseECUInit = 0xFF,
 };
 
-typedef struct {
-  byte header;
-  SSMDevice destination;
-  SSMDevice source;
-  byte dataSize;
-  SSMCmd command;
-  SSMResponse responseType;
-  byte *data;
-  byte checksum;
-} SSMPacket;
+enum SSMResponseType {
+  kSSMResponseTypeSingle = 0x00,
+  kSSMResponseTypeStreamed = 0x01,
+};
 
 byte SSMHeader = 0x80;
 byte SSMAddressSize = 0x3;
-byte SSMPacketDataOffset = 6;
-byte SSMPacketHeaderSize = 7; // minus the data portion
+byte SSMPacketDataOffset = 4;
 
 enum SSMRequestState {
   SSMRequestInit,
   SSMRequestBlock1,
   SSMRequestBlock2,
+  SSMRequestSet1,
 };
 
 typedef struct {
@@ -70,16 +76,35 @@ typedef struct {
 } SSMRequest;
 
 byte SSMMemory[304]; // 304 bytes should fit all the data
-SSMRequestState requestState = SSMRequestInit;
+//SSMRequestState requestState = SSMRequestInit;
+SSMRequestState requestState = SSMRequestSet1;
+//SSMRequestState requestState = SSMRequestBlock1;
+
 SSMRequest block1Request = { SSMRequestBlock1, 0x7, 98 };
 SSMRequest block2Request = { SSMRequestBlock2, 0xCE, 83 };
 
+byte SSMRequestSet1Size = 9;
+byte SSMRequestSet1Data[9] = {
+  0x0F, // Parameter: RPM low byte
+  0x0E, // Parameter: RPM high byte
+  0x0D, // Parameter: MAP
+  0x08, // Parameter: Temp
+  0x10, // Parameter: Speed
+  0x12, // Parameter: IAT
+  0x15, // Parameter: TPS
+  0x1C, // Parameter: Battery
+  0x46, // Parameter: AFR  
+};
+
+
 SoftwareSerial gSerialPort = SoftwareSerial(7, 6); // Rx, Tx
-byte SoftwareSerialNoData = -1;
 bool IsClearToSend = true;
 int SerialReadDelayMS = 2;
 unsigned long prvTime = 0;
 unsigned long curTime = 0;
+
+int oilPressurePin = 3;
+int fuelLevelPin = 4;
 
 typedef struct {
   uint16_t canID;
@@ -89,8 +114,8 @@ typedef struct {
 SSMData priority0[] = {
   {
     0x259,// CAN ID 601
-    0x0E, // Engine Speed 2 (RPM)
-    0x0F, // Engine Speed 1 (RPM)
+    0x0F, // Engine Speed 2 (RPM)
+    0x0E, // Engine Speed 1 (RPM)
     0x46, // Air/Fuel Sensor #1
     0x15, // Throttle Opening Angle 
     0x0D, // Manifold Absolute Pressure
@@ -110,10 +135,10 @@ SSMData priority1[] = {
     0x16, // Front O2 Sensor #1   
     0x17, // Front O2 Sensor #1 - 2
     0x18, // Rear O2 Sensor
-    0x19, // Rear O2 Sensor - 2
+    0x19, // Oil pressure (psi)
   },
   {
-    0x25B,// CAN ID
+    0x25B,// CAN ID 603
     0x07, // Engine Load    
     0x09, // Air/Fuel Correction #1 
     0x0A, // Air/Fuel Learning #1   
@@ -138,7 +163,7 @@ SSMData priority2[] =  {
     0x22, // Knock Correction
   },
   {
-    0x25D, // CAN ID
+    0x25D, // CAN ID - 605
     0x24, // Manifold Relative Pressure
     0x25, // Pressure Differential Sensor
     0x26, // Fuel Tank Pressure
@@ -149,10 +174,10 @@ SSMData priority2[] =  {
     0x2B  // Front O2 Heater #1
   },
   {
-    0x25E, // CAN ID
+    0x25E, // CAN ID - 606
     0x2C, // Rear O2 Heater Current
     0x2D, // Front O2 Heater #2
-    0x2E, // Fuel Level
+    0x2E, // Fuel Level (%)
     0x31, // Secondary Wastegate Duty Cycle
     0x32, // CPC Valve Duty Ratio
     0x33, // Tumble Valve Position Sensor Right
@@ -240,6 +265,7 @@ typedef struct {
 
 #define NUM_CAN_PRIORITIES 4
 
+// cycleCount | cycle to trigger on | current index | numIndexes // 
 CanPriority counterSchedule[NUM_CAN_PRIORITIES] = { 
    {0, 1, 0, 1},
    {0, 2, 0, 2},
@@ -265,13 +291,11 @@ void setup()
   do{
     delay(50);
   } while (!gSerialPort);
+  DPRINTLN("SSM Serial Line Established.");
 
-  DPRINTLN("Can Init");
+  DPRINTLN("Initializing CAN bus...");
   CAN.begin(CAN_BPS_500K);
-
-  DPRINTLN("SSM Serial Line Established");
-  DPRINTLN("SSM Initializing...");
-  sendRequestForState(requestState);
+  DPRINTLN("CAN Bus Initialized.");
 
   prvTime = millis();
 }
@@ -284,89 +308,418 @@ void loop()
   curTime = millis();
   if ((curTime - prvTime) > 1000) {
     gSerialPort.flush();
-    sendRequestForState(requestState); // re-send the current request
+    DPRINTLN("-----flush-----");
+    sendSSMRequestForState(requestState); // re-send the current request
     prvTime = curTime;
+  }
+
+  if (readSSMResponse()) {
+    prvTime = curTime;
+    IsClearToSend = true;
   }
 
   if (DEBUG_CAN)
     generateRandomSSMData();
 
-  if (gSerialPort.available()) {    
-    if (requestState = SSMRequestInit) {
-      DPRINTLN("SSM Init finished, requesting block data...");
-      requestState = SSMRequestBlock1;
-    }
-    else if (requestState == SSMRequestBlock1) {
-      requestState == SSMRequestBlock2;
-      SSMPacket *packet = readPacketFromSSMBus();
-      if (packet) {
-        memcpy(&(SSMMemory[block1Request.location]), packet->data, block1Request.length);
-        free(packet);
-      } else {
-        DPRINTLN("Err: could not create packet from block 1");
-      }
-    }
-    else if (requestState == SSMRequestBlock2) {
-      requestState == SSMRequestBlock1;
-      SSMPacket *packet = readPacketFromSSMBus();
-      if (packet) {
-        memcpy(&(SSMMemory[block2Request.location]), packet->data, block2Request.length);
-        free(packet);
-      } else {
-        DPRINTLN("Err: could not create packet from block 2");
-      }
-    }
-    
-    prvTime = curTime;
+  readAnalogPinsIntoSSMMemory();
+  sendCANPacketsFromSSMMemory();
+  
+  if (IsClearToSend && !DEBUG_CAN) {
+    sendSSMRequestForState(requestState);
+    IsClearToSend = false;
   }
+}
 
+void sendCANPacketsFromSSMMemory() {
   for (int i=0; i<NUM_CAN_PRIORITIES; i++) {
     CanPriority *cp = &counterSchedule[i];
     cp->cycleCount++;
     if (cp->cycleCount >= cp->cycle) {
       cp->cycleCount = 0;
+
       cp->index++;
-      if (cp->index >= cp->numIndexes) {
+      if (cp->index >= cp->numIndexes)
         cp->index = 0;
 
-        switch(i) {
-          case 0:
-             sendCANPacketFor(&priority0[cp->index], &SSMMemory[0]);
-             break;
-          case 1:
-             sendCANPacketFor(&priority1[cp->index], &SSMMemory[0]);
-             break;
-          case 2:
-             sendCANPacketFor(&priority2[cp->index], &SSMMemory[0]);
-             break;
-          case 3:
-             sendCANPacketFor(&priority3[cp->index], &SSMMemory[0]);
-             break;
-          default:
-             DPRINT("Err: Unhandled priority: ");
-             DPRINTLN(i);
-             break;
-        }
+      switch(i) {
+        case 0:
+           sendCANPacketFor(&priority0[cp->index], &SSMMemory[0]);
+           break;
+        case 1:
+           sendCANPacketFor(&priority1[cp->index], &SSMMemory[0]);
+           break;
+        case 2:
+           sendCANPacketFor(&priority2[cp->index], &SSMMemory[0]);
+           break;
+        case 3:
+           sendCANPacketFor(&priority3[cp->index], &SSMMemory[0]);
+           break;
+        default:
+           DPRINT("Err: Unhandled priority: ");
+           DPRINTLN(i);
+           break;
       }
     }
   }
+}
 
-  if (IsClearToSend && !DEBUG_CAN) {
-    sendRequestForState(requestState);
-    IsClearToSend = false;
+uint8_t sendCANPacketFor(SSMData *ssmData, byte *ssmMemory) {
+  CAN_Frame standard_message; // Create message object to use CAN message structure
+  standard_message.id = ssmData->canID;
+  standard_message.valid = true;
+  standard_message.rtr = 0;
+  standard_message.extended = CAN_STANDARD_FRAME;
+  standard_message.timeout = 100;
+  standard_message.length = 8; // Data length
+
+  //DPRINTLN(ssmData->canID);
+
+  // Fill in the frame with data from the SSM memory
+  for(int i=0; i<8; i++) {    
+    standard_message.data[i] = ssmMemory[ssmData->data[i]];
+  }
+
+  int bytesSent = CAN.write(standard_message); // Load message and send
+  //DPRINTLN(bytesSent);
+
+  return bytesSent;
+}
+
+void sendSSMRequestForState(SSMRequestState state)
+{
+  switch (state) {
+    case SSMRequestInit:
+      DPRINTLN("Requesting SSM init...");
+      sendSSMPacket(packetForSSMInit(), gSerialPort);
+      break;
+      
+    case SSMRequestBlock1:
+      DPRINTLN("Requesting SSM block 1...");
+      sendSSMPacket(packetForBlockRead(block1Request.location, block1Request.length), gSerialPort);
+      break;
+
+    case SSMRequestBlock2:
+      DPRINTLN("Requesting SSM block 2...");
+      sendSSMPacket(packetForBlockRead(block2Request.location, block2Request.length), gSerialPort);
+      break;
+
+    case SSMRequestSet1:
+      DPRINTLN("Requesting SSM set 1...");
+      SSMPacket *p = packetForNumberOfAddresses(kSSMCommandAddressRead, 9);
+      for (byte i=1; i<=SSMRequestSet1Size; i++){
+        p->data[1 + (3*i)] = SSMRequestSet1Data[i-1];
+      }
+      sendSSMPacket(p, gSerialPort);
+      break;
   }
 }
 
+bool readSSMResponse() {
+  if (!gSerialPort.available()) {
+    return false;
+  }  
+
+  SSMPacket *packet = readPacketFromSSMBus();
+  if (!packet) {
+     DPRINT("ERR: Could not create SSM response packet for request state: ");
+     DPRINTLN(requestState);
+     return false;
+  }
+
+  switch (requestState) {
+    case SSMRequestInit: 
+      requestState = SSMRequestBlock1;      
+      //requestState = SSMRequestSet1;      
+      break;
+    case SSMRequestBlock1:
+      // advance past the response code
+      memcpy(&SSMMemory[block1Request.location], packet->data + 1, packet->dataSize - 1);      
+      // next state
+      requestState = SSMRequestBlock2;
+      break;
+    case SSMRequestBlock2:
+      // advance past the response code
+      memcpy(&SSMMemory[block2Request.location], packet->data + 1, packet->dataSize - 1);
+      // next state
+      requestState = SSMRequestBlock1;
+      break;
+    case SSMRequestSet1:
+      for (byte i=1; i<=(packet->dataSize - 1); i++){
+        SSMMemory[ SSMRequestSet1Data[i-1] ] = packet->data[i];
+      }
+      break;
+  }
+  
+  freePacket(packet);
+  return true;
+}
+
+// -----------------------------------------------
+//   Packet Builders
+// -----------------------------------------------
+SSMPacket *packetForSSMInit() {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;
+  packet->dataSize = 1;
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = kSSMCommandECUInit;
+  return packet;
+}
+
+SSMPacket *packetForBlockRead(byte baseByte, byte numberOfBytes) {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;
+  packet->dataSize = 6;
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = kSSMCommandBlockRead;
+  packet->data[1] = kSSMResponseTypeSingle;
+  packet->data[2] = 0x00;
+  packet->data[3] = 0x00;
+  packet->data[4] = baseByte;
+  packet->data[5] = (numberOfBytes-1);
+  return packet;
+}
+
+SSMPacket *packetForNumberOfAddresses(SSMCommand command, byte numberOfBytes) {
+  int addressRequestSize = SSMAddressSize * numberOfBytes;
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;  
+  packet->dataSize = (2 + addressRequestSize);
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = command;
+  packet->data[1] = kSSMResponseTypeSingle;
+  for (byte i=0; i < addressRequestSize; i++) {
+     packet->data[2+i] = 0x0;
+  }
+  return packet;
+}
+
+void freePacket(SSMPacket *packet) {
+  if (packet->data)
+    free(packet->data);
+  if (packet)
+    free(packet);
+}
+
+// -----------------------------------------------
+//  Transport
+// -----------------------------------------------
+
+void sendSSMPacket(SSMPacket *packet, SoftwareSerial &ss) {
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[0], HEX);
+  DPRINTLN(" - header");
+  
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[1], HEX);
+  DPRINTLN(" - destination");
+
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[2], HEX);
+  DPRINTLN(" - source");
+
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[3], HEX);
+  DPRINTLN(" - dataSize");
+
+  int numBytesWritten = 0;
+
+  byte checksum = 0;
+  for (byte i = 0; i < SSMPacketDataOffset; i++) {
+    byte value = ((byte *)packet)[i];
+    checksum += value;
+    numBytesWritten += ss.write(value);
+  }
+
+  for (byte i = 0; i < packet->dataSize; i++) {
+    byte value = packet->data[i];
+    DPRINT("0x");
+    DPRINT(value, HEX);
+    DPRINTLN(" - data");
+
+    checksum += value;
+    numBytesWritten += ss.write(value);
+  }
+
+  DPRINT("0x");
+  DPRINT(checksum, HEX);
+  DPRINTLN(" - checksum");
+  
+  numBytesWritten += ss.write(checksum);
+
+//  DPRINT("wrote # bytes: ");
+//  DPRINTLN(numBytesWritten);
+  DPRINTLN(" ");
+
+  freePacket(packet);
+}
+
+/* returns the 8 least significant bits of an input byte*/
+byte computeChecksum(byte sum) {
+  byte counter = 0;
+  byte power = 1;
+  for (byte n = 0; n < 8; n++) {
+    counter += bitRead(sum, n) * power;
+    power = power * 2;
+  }
+  return counter;
+}
+
+//
+// This will change the values in dataArray, populating them with 
+// values respective of the poll array address calls
+//
+SSMPacket *readPacketFromSSMBus() {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->data = NULL;
+  boolean isPacket = false;
+  
+  byte data = 0;
+  byte *dataArray;
+  int numReadExpected;
+  int numReadActual;
+  
+  byte sumBytes = 0;
+  int dataSize = 0;
+  byte bytePlace = 0;
+  byte loopLength = 20;
+
+  //DPRINTLN("-------- read ----------");
+
+  numReadExpected = 1;
+
+  for (byte j = 0; j < loopLength; j++) {
+    if (!gSerialPort.available()) {
+      delay(SerialReadDelayMS);
+      continue;
+    }
+
+//    if (packet->data && packet->dataSize > 0 && packet->data[0] == 0) {
+//      numReadActual = gSerialPort.readBytes(packet->data, packet->dataSize);
+//      DPRINT("Expected vs Recieved: ");
+//      DPRINT(packet->dataSize);
+//      DPRINT("/");
+//      DPRINTLN(numReadActual);
+//      for (int i=0; i<numReadActual; i++) {
+//        DPRINT("0x");
+//        DPRINT(packet->data[i], HEX);
+//        DPRINT(" - b:");
+//        DPRINTLN(i);
+//      }
+//    } else
+    numReadActual = gSerialPort.readBytes(&data, numReadExpected);
+  
+    // Header marks the beginning of a packet
+    if (data == SSMHeader && dataSize == 0) {
+      isPacket = true;
+      j = 0;
+      DPRINTLN("--------Begin Packet--------");
+    }
+
+    // Terminate if no response is detected
+    if (!isPacket && (j == (loopLength - 1))) {
+      DPRINTLN("no data");
+      break;
+    }
+
+    if (!isPacket || numReadActual == 0) {
+      delay(SerialReadDelayMS);
+      continue;
+    }
+
+    DPRINT(bytePlace);
+    DPRINT(" ");
+    DPRINT("0x");
+    DPRINT(data, HEX);
+    
+    if (bytePlace == 0) {
+      DPRINT(" - header");
+      packet->header = data;
+    }
+    else if (bytePlace == 1) {
+      DPRINT(" - destination");
+      packet->destination = data;
+    }
+    else if (bytePlace == 2) {
+      DPRINT(" - source");
+      packet->source = data;
+    }
+    else if (bytePlace == 3) { // how much data is coming
+      dataSize = data;
+      packet->dataSize = dataSize;
+      packet->data = (byte *)malloc( packet->dataSize );
+      DPRINT(" - data size: ");
+      DPRINT(packet->dataSize);
+
+      loopLength += dataSize;
+    }
+    else if (bytePlace > 3 && bytePlace - 4 < dataSize) {
+      packet->data[bytePlace - 4] = data;
+      DPRINT(" - b:");
+      DPRINT((bytePlace - 3));
+    }
+    else if (bytePlace == (4 + dataSize)) {
+      DPRINTLN(" - checksum");
+      
+      // the 8 least significant bits of sumBytes
+      if (data == computeChecksum(sumBytes)) {
+        DPRINTLN("------ End Packet ------");
+        DPRINTLN("");
+        return packet;
+      }
+      else {
+        DPRINT("ERR: Checksum: ");
+        DPRINT(data, HEX);
+        DPRINT(" != calculated: ");
+        DPRINT(computeChecksum(sumBytes), HEX);
+        DPRINTLN("");
+        break;
+      }
+    }
+
+    sumBytes += data; // this is to compare with the checksum byte
+    bytePlace++;
+    
+    DPRINTLN("");
+  }
+
+  DPRINTLN("--------returning----------");
+  freePacket(packet);
+  return NULL;
+}
+
+void readAnalogPinsIntoSSMMemory() {  
+  // 1023 @ 0bar, 512 @ 10bar
+  int oilPressure = analogRead(oilPressurePin);
+  if (oilPressure)
+    SSMMemory[0x19] = (byte)((10.0 - ((oilPressure - 512.0)/51.2)) * 14.5);  // 0-10bar converted to psi
+  else
+    SSMMemory[0x19] = 0;
+  
+  // 1023 @ full tank, 512 @ empty tank
+  int fuelLevel = analogRead(fuelLevelPin);
+  if (fuelLevel)
+    SSMMemory[0x2E] = (int)(100.0 * ((fuelLevel - 512)/512.0));
+  else
+    SSMMemory[0x2E] = 0;
+
+  //DPRINTLN("Read analog pins");
+}
+
 void generateRandomSSMData() {
-
-#define MINRPM (750 * 4)
-#define RPMINC (10*4)
-#define MAXRPM (7500 *4)
-
+  #define MINRPM (750 * 4)
+  #define RPMINC (10*4)
+  #define MAXRPM (7500 *4)
   static uint16_t gRPM = (6201 * 4);
-//  gRPM += RPMINC;
-//  if (gRPM > MAXRPM)
-//    gRPM = MINRPM;
+  gRPM += RPMINC;
+  if (gRPM > MAXRPM)
+    gRPM = MINRPM;
 
   SSMMemory[0x0E] = (gRPM & 0xff);
   SSMMemory[0x0F] = (gRPM >> 8);
@@ -403,220 +756,6 @@ void generateRandomSSMData() {
     KPH = 0;
   SSMMemory[0x10] = 100;
 }
-
-uint8_t sendCANPacketFor(SSMData *ssmData, byte *ssmMemory) {
-  CAN_Frame standard_message; // Create message object to use CAN message structure
-  standard_message.id = ssmData->canID;
-  standard_message.valid = true;
-  standard_message.rtr = 0;
-  standard_message.extended = CAN_STANDARD_FRAME;
-  standard_message.timeout = 100;
-  standard_message.length = 8; // Data length
-
-  // Fill in the frame with data from the SSM memory
-  for(int i=0; i<8; i++) {    
-    standard_message.data[i] = ssmMemory[ssmData->data[i]];
-  }
-
-  return CAN.write(standard_message); // Load message and send
-}
-
-void sendRequestForState(SSMRequestState state)
-{
-  switch (state) {
-    case SSMRequestInit:
-      sendSSMPacket(packetForSSMInit(), gSerialPort);
-      break;
-      
-    case SSMRequestBlock1:
-      sendSSMPacket(packetForBlockRead(block1Request.location, block1Request.length), gSerialPort);
-      break;
-
-    case SSMRequestBlock2:
-      sendSSMPacket(packetForBlockRead(block2Request.location, block2Request.length), gSerialPort);
-      break;     
-  }
-}
-
-// -----------------------------------------------
-//   Packet Builders
-// -----------------------------------------------
-SSMPacket *packetForSSMInit() {
-  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
-  packet->header = SSMHeader;
-  packet->destination = kSSMDeviceECU;
-  packet->source = kSSMDeviceDiagTool;
-  packet->dataSize = SSMPacketHeaderSize;
-  packet->command = kSSMCmdECUInit;
-  packet->responseType = kSSMResponseSingle;
-  packet->data = NULL;
-  return packet;
-}
-
-SSMPacket *packetForNumberOfAddresses(SSMCmd command, byte numberOfBytes) {
-  int addressRequestSize = SSMAddressSize * numberOfBytes;
-  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
-  packet->header = SSMHeader;
-  packet->destination = kSSMDeviceECU;
-  packet->source = kSSMDeviceDiagTool;
-  packet->dataSize = SSMPacketHeaderSize + addressRequestSize;
-  packet->command = command;
-  packet->responseType = kSSMResponseSingle;
-  packet->data = (byte *)malloc( addressRequestSize );
-
-  for (byte x = 0; x < addressRequestSize; x++) {
-     packet->data[x] = 0xFF;
-  }
-  
-  return packet;
-}
-
-SSMPacket *packetForBlockRead(byte baseByte, byte numberOfBytes) {
-  int addressRequestSize = SSMAddressSize * numberOfBytes;
-  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
-  packet->header = SSMHeader;
-  packet->destination = kSSMDeviceECU;
-  packet->source = kSSMDeviceDiagTool;
-  packet->dataSize = SSMPacketHeaderSize + addressRequestSize;
-  packet->command = kSSMCmdBlockRead;
-  packet->responseType = kSSMResponseSingle;
-  packet->data = (byte *)malloc( 4 );
-  packet->data[0] = 0x00;
-  packet->data[1] = 0x00;
-  packet->data[2] = baseByte;
-  packet->data[3] = numberOfBytes;
-  return packet;
-}
-
-
-// -----------------------------------------------
-//  Transport
-// -----------------------------------------------
-
-void sendSSMPacket(SSMPacket *packet, SoftwareSerial &digiSerial) {
-  byte numDataBytes = (packet->dataSize - SSMPacketHeaderSize);  
-
-  for (byte x = 0; x < SSMPacketDataOffset; x++) {
-    digiSerial.write(((byte *)packet)[x]);
-  }
-
-  for (byte x = 0; x < numDataBytes; x++) {
-    digiSerial.write(packet->data[x]);
-  }
-
-  byte checksum = 0;
-  checksum += packet->header;
-  checksum += packet->destination;
-  checksum += packet->source;
-  checksum += packet->dataSize;
-  checksum += packet->command;
-  checksum += packet->responseType;
-  for(int i=0; i< (packet->dataSize - SSMPacketHeaderSize); i++) {
-    checksum += packet->data[i];
-  }
-
-  digiSerial.write(checksum);
-
-  free( packet->data );
-  free( packet );
-}
-
-/* returns the 8 least significant bits of an input byte*/
-byte computeChecksum(byte sum) {
-  byte counter = 0;
-  byte power = 1;
-  for (byte n = 0; n < 8; n++) {
-    counter += bitRead(sum, n) * power;
-    power = power * 2;
-  }
-  return counter;
-}
-
-//
-// This will change the values in dataArray, populating them with 
-// values respective of the poll array address calls
-//
-SSMPacket *readPacketFromSSMBus()
-{
-  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
-  boolean isPacket = false;
-  byte data = 0;
-  byte sumBytes = 0;
-  byte dataSize = 0;
-  byte bytePlace = 0;
-  byte loopLength = 20;
-
-  for (byte j = 0; j < loopLength; j++)
-  {
-    data = gSerialPort.read();
-
-    // Header marks the beginning of a packet
-    if (data == SSMHeader && dataSize == 0) {
-      isPacket = true;
-      j = 0;
-      DPRINTLN("Begin Packet");
-      packet->header = data;
-    }
-
-    // terminate function and return false if no response is detected
-    if (!isPacket && (j == (loopLength - 1))) {
-      DPRINTLN("no data");
-      free(packet);
-      return NULL;
-    }
-
-    if (!isPacket || data == SoftwareSerialNoData) {
-      delay(SerialReadDelayMS);
-      continue;
-    }
-    
-    DPRINT(data); // for debugging: shows in-packet data
-    DPRINT(" ");
-
-    ((byte *)packet)[bytePlace] = data;
-
-    if (bytePlace == 3) { // how much data is coming
-      dataSize = data;
-      loopLength = dataSize + SSMPacketDataOffset;
-
-      packet->data = (byte *)malloc( dataSize );
-    }
-
-    if (bytePlace > 4 && bytePlace - 5 < dataSize)
-    {
-      packet->data[bytePlace - 5] = data;
-    }
-
-    // increment bytePlace
-    bytePlace += 1;
-
-    // Once the data is all received, checksum and re-set counters
-    DPRINT("byte place: ");
-    DPRINTLN(bytePlace);
-      
-    if (bytePlace == dataSize + 5) {
-      //the 8 least significant bits of sumBytes
-      if (data != computeChecksum(sumBytes)) {
-        DPRINTLN(F("checksum error"));
-        free( packet->data );
-        free( packet );
-        return NULL;
-      }
-
-      DPRINTLN("Checksum is good");
-
-      IsClearToSend = true;
-      return packet;
-    }
-    else
-    {
-      sumBytes += data; // this is to compare with the checksum byte
-      //DPRINT(F("sum: "));
-      //DPRINTLN(sumBytes);
-    }
-  }
-}
-
 
 
 
