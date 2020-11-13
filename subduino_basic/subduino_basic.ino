@@ -240,6 +240,3 @@ void CAN2RCP1(byte Rpm1, byte Rpm2, byte AFR, byte Tps, byte MAP, byte IAT, byte
   DPRINT(numBytesSent);
   DPRINTLN();
 }
-
-
-

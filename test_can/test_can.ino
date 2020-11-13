@@ -24,7 +24,6 @@ unsigned long prvTime;
 unsigned long curTime;
 
 void setup() {
-  
   CAN_MCP2515( 10 );  
   
   Serial.begin(115200); //for diagnostics
@@ -109,7 +108,3 @@ uint8_t CAN2RCP1(byte Rpm1, byte Rpm2, byte AFR, byte Tps, byte MAP, byte IAT, b
   
   return CAN.write(standard_message); // Load message and sent
 }
-
-
-
-
